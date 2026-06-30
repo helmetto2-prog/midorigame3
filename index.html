@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>倉庫番 スマホ版</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; }
+  body { background:#0c1024; display:flex; flex-direction:column; align-items:center; justify-content:flex-start;
+         min-height:100vh; font-family:'Segoe UI','MS PGothic',sans-serif;
+         overflow-x:hidden; touch-action:manipulation; -webkit-user-select:none; user-select:none; padding:6px 0 16px; }
+  canvas { display:block; box-shadow:0 0 36px rgba(120,150,255,0.3); border-radius:8px;
+           width:min(96vw, 460px); height:auto; touch-action:none; }
+  #hint { color:#8aa; font-size:11px; margin-top:6px; text-align:center; padding:0 8px; line-height:1.6; }
+  #hint b { color:#bdd; }
+  #controls { display:flex; gap:14px; align-items:center; justify-content:center; margin-top:10px; flex-wrap:wrap; width:100%; }
+  #actions { display:flex; flex-direction:column; gap:8px; }
+  #actions button { font-family:inherit; font-weight:800; color:#dce8ff; background:#19223e;
+    border:1px solid #38507e; border-radius:12px; padding:11px 14px; font-size:14px; min-width:120px;
+    box-shadow:0 2px 8px rgba(0,0,0,.4); touch-action:manipulation; cursor:pointer; }
+  #actions button:active { background:#26345c; transform:translateY(1px); }
+  #actions .go { background:#2a6cc9; border-color:#4f93e6; color:#fff; }
+  #dpad { display:grid; grid-template-columns:repeat(3,58px); grid-template-rows:repeat(3,58px); gap:7px; }
+  #dpad button { font-family:inherit; font-weight:800; font-size:22px; color:#dce8ff; background:#19223e;
+    border:1px solid #38507e; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,.4); touch-action:manipulation; cursor:pointer; }
+  #dpad button:active { background:#3a4f86; transform:translateY(1px); }
+  #dpad span { visibility:hidden; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="520"></canvas>
+<div id="hint">📱 盤面を<b>スワイプ</b>か下の<b>十字ボタン</b>で押す ／ 箱は引けません ／ <b>もどす</b>でやり直せます<br>
+💻 PC：← ↑ → ↓ 押す ・ Z/U もどす ・ R やり直し ・ M 音 ・ P ポーズ</div>
+
+<div id="controls">
+  <div id="actions">
+    <button id="bNext" class="go">▶ スタート / 次へ</button>
+    <button id="bUndo">↶ もどす</button>
+    <button id="bRestart">⟳ やり直し</button>
+    <button id="bSound">♪ 音 ON/OFF</button>
+  </div>
+  <div id="dpad">
+    <span></span><button id="bUp">▲</button><span></span>
+    <button id="bLeft">◀</button><span></span><button id="bRight">▶</button>
+    <span></span><button id="bDown">▼</button><span></span>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ===== ENGINE (reusable: loop, state, Input, SFX, FX, helpers) ===== */
+const C = document.getElementById('c'), ctx = C.getContext('2d');
+const W = C.width, H = C.height;
+const clock = () => performance.now();
+const clamp = (v,a,b) => v<a?a:v>b?b:v;
+let state = 'title';
+let G = null;
+
+const Input = (function(){
+  const keys=new Set(), edge=new Set();
+  const BLOCK=['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'];
+  document.addEventListener('keydown', e => { SFX.ensure(); if(BLOCK.includes(e.code)) e.preventDefault();
+    if(!keys.has(e.code)) edge.add(e.code); keys.add(e.code); onKey(e.code); });
+  document.addEventListener('keyup', e => keys.delete(e.code));
+  C.addEventListener('click', () => { SFX.ensure(); if(state==='title'||state==='over') onKey('Space'); });
+  return { held:c=>keys.has(c), pressed:c=>edge.has(c), clearEdges:()=>edge.clear() };
+})();
+
+const SFX = (function(){
+  let ac=null,master=null,on=true;
+  const midi=n=>440*Math.pow(2,(n-69)/12);
+  function tone(f,d,t,v){ if(!ac)return; const s=ac.currentTime+0.01,o=ac.createOscillator(),g=ac.createGain();
+    o.type=t;o.frequency.value=f;g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(v,s+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0006,s+d);o.connect(g).connect(master);o.start(s);o.stop(s+d+0.03); }
+  function noise(v,fr,d){ if(!ac)return; const s=ac.currentTime+0.01,b=ac.createBuffer(1,1024,ac.sampleRate),dt=b.getChannelData(0);
+    for(let i=0;i<dt.length;i++)dt[i]=Math.random()*2-1; const src=ac.createBufferSource();src.buffer=b;
+    const f=ac.createBiquadFilter();f.type='bandpass';f.frequency.value=fr;const g=ac.createGain();
+    g.gain.setValueAtTime(v,s);g.gain.exponentialRampToValueAtTime(0.001,s+d);src.connect(f).connect(g).connect(master);src.start(s);src.stop(s+d+0.05); }
+  let bgmIv=null, step=0;
+  const STEPMS=60000/158/4;
+  const BASS=[36,36,43,36, 43,43,45,43, 45,45,41,45, 41,41,43,43];
+  const LEAD=[72,76,79,76, 74,79,83,79, 72,76,81,76, 77,81,79,76];
+  function bgmTick(){ if(!ac) return;
+    tone(midi(BASS[step]),0.16,'triangle',0.15);
+    tone(midi(LEAD[step]),0.11,'square',0.06);
+    if(step%4===0) tone(60,0.12,'sine',0.22);
+    if(step%2===1) noise(0.045,7000,0.03);
+    step=(step+1)%16; }
+  return {
+    get on(){return on;},
+    ensure(){ try{ if(!ac){ const A=window.AudioContext||window.webkitAudioContext; if(!A)return;
+      ac=new A();master=ac.createGain();master.gain.value=on?0.2:0;master.connect(ac.destination);} if(ac.state==='suspended')ac.resume(); }catch(e){} },
+    toggle(){ on=!on; if(master)master.gain.value=on?0.2:0; },
+    startBGM(){ this.ensure(); if(ac && !bgmIv){ step=0; bgmIv=setInterval(bgmTick,STEPMS); } },
+    stopBGM(){ if(bgmIv){ clearInterval(bgmIv); bgmIv=null; } },
+    move(){ tone(300,0.05,'square',0.05); noise(0.04,400,0.04); },
+    undo(){ tone(440,0.06,'triangle',0.06); },
+    place(){ tone(660,0.08,'square',0.08); tone(990,0.07,'triangle',0.05); },
+    blocked(){ tone(120,0.06,'sawtooth',0.05); },
+    win(){ [60,64,67,72].forEach((m,i)=>setTimeout(()=>tone(midi(m),0.25,'square',0.12),i*120)); },
+  };
+})();
+
+const FX = (function(){
+  let parts=[],shake=0;
+  return {
+    burst(x,y,col,n){ n=n||8; for(let i=0;i<n;i++){ const a=Math.random()*6.2832,s=1.5+Math.random()*3.5;
+      parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-1.5,col:col||'#fff',life:0,dur:0.4+Math.random()*0.3}); } },
+    shake(a){ shake=Math.max(shake,a); },
+    update(dt){ const f=dt/16; for(const p of parts){ p.life+=dt/1000;p.x+=p.vx*f;p.y+=p.vy*f;p.vy+=0.4*f; }
+      parts=parts.filter(p=>p.life<p.dur); shake=Math.max(0,shake-dt/16); },
+    preDraw(){ if(shake>0){ ctx.save(); ctx.translate((Math.random()-0.5)*shake,(Math.random()-0.5)*shake);} },
+    postDraw(){ if(shake>0)ctx.restore(); for(const p of parts){ ctx.save();ctx.globalAlpha=Math.max(0,1-p.life/p.dur);
+      ctx.fillStyle=p.col;ctx.beginPath();ctx.arc(p.x,p.y,3,0,6.2832);ctx.fill();ctx.restore(); } },
+  };
+})();
+
+function clearBG(){ const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#141a3a'); g.addColorStop(1,'#0c1024'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H); }
+function rrect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function overlay(title,col,sub){ ctx.fillStyle='rgba(0,0,0,0.68)'; ctx.fillRect(0,0,W,H); ctx.textAlign='center';
+  ctx.fillStyle=col; ctx.font='bold 40px "Segoe UI"'; ctx.fillText(title,W/2,H/2-14);
+  ctx.fillStyle='#aaa'; ctx.font='15px "Segoe UI"'; ctx.fillText(sub,W/2,H/2+40); }
+
+let lastT=0;
+function loop(t){ const dt=lastT?Math.min(50,t-lastT):16; lastT=t; if(state==='play')update(dt); FX.update(dt); render(); Input.clearEdges(); requestAnimationFrame(loop); }
+
+/* ===== GAME : 倉庫番 (Sokoban) スマホ版 ===== */
+// レベル: # 壁 / . 目標 / $ 箱 / * 箱(目標上) / @ プレイヤー / + プレイヤー(目標上) / 空白 床
+// 全10面。やさしい→難関の昇順。1〜2面は軽い導入、3面以降は検証済みの難問、10面は最難関。
+const LEVELS = [
+  // 1: 2箱・上下へ運ぶ導入（やさしい）
+  ["#######",
+   "# .   #",
+   "# $   #",
+   "#   @ #",
+   "#   $ #",
+   "#   . #",
+   "#######"],
+  // 2: 2箱・上の左右角へ寄せる（ややむず）
+  ["#######",
+   "#.   .#",
+   "#  $  #",
+   "# $   #",
+   "#  @  #",
+   "#######"],
+  // 3: 3箱・真ん中が壁で迂回（ふつう）
+  ["#######",
+   "#  .  #",
+   "# .#. #",
+   "# $$$ #",
+   "#  @  #",
+   "#######"],
+  // 4: 十字・四方へ押す定番（ふつう）
+  ["#######",
+   "#  .  #",
+   "#  $  #",
+   "#.$@$.#",
+   "#  $  #",
+   "#  .  #",
+   "#######"],
+  // 5: 4箱・中央へ寄せる（むずかしい）
+  ["#######",
+   "#.   .#",
+   "#  $  #",
+   "# $@$ #",
+   "#  .  #",
+   "#######"],
+  // 6: 3箱・斜め上の目標へL字（むずかしい）
+  ["########",
+   "# . . .#",
+   "#      #",
+   "# $$$  #",
+   "#   @  #",
+   "########"],
+  // 7: 4箱・壁まじりで運び分け（高難度）
+  ["#######",
+   "#. $  #",
+   "# $#$ #",
+   "#  $ .#",
+   "#. @ .#",
+   "#######"],
+  // 8: 4箱・上下へふりわけ（高難度）
+  ["########",
+   "#  ..  #",
+   "# $$$$ #",
+   "#  ..  #",
+   "#  @   #",
+   "########"],
+  // 9: 4箱・対角バラバラ方向（激ムズ）
+  ["########",
+   "# .  $ #",
+   "# $  . #",
+   "#  @   #",
+   "# .  $ #",
+   "# $  . #",
+   "########"],
+  // 10: 密集十字・順番が肝（★最難関★）
+  ["#######",
+   "#  @  #",
+   "# $.$ #",
+   "#.$#$.#",
+   "# $.$ #",
+   "#  .  #",
+   "#######"],
+];
+// 難易度（★1〜5）と呼び名（昇順）
+const STARS = [1,2,2,3,3,4,4,4,5,5];
+const DNAME = ['やさしい','ややむず','ふつう','ふつう','むずかしい','むずかしい','高難度','高難度','激ムズ','★最難関★'];
+function starStr(n){ return '★'.repeat(n)+'☆'.repeat(5-n); }
+
+function loadLevel(i){
+  const map=LEVELS[i];
+  const rows=map.length, cols=Math.max.apply(null, map.map(s=>s.length));
+  const walls=new Set(), goals=new Set(), boxes=new Set(); let px=0,py=0;
+  for(let y=0;y<rows;y++){ const line=map[y]; for(let x=0;x<cols;x++){ const ch=line[x]||' ';
+    if(ch==='#') walls.add(x+','+y);
+    else if(ch==='.') goals.add(x+','+y);
+    else if(ch==='$') boxes.add(x+','+y);
+    else if(ch==='*'){ boxes.add(x+','+y); goals.add(x+','+y); }
+    else if(ch==='@'){ px=x; py=y; }
+    else if(ch==='+'){ px=x; py=y; goals.add(x+','+y); } } }
+  const ts=Math.min(Math.floor(440/cols), Math.floor(380/rows), 50);
+  const ox=Math.round((W-cols*ts)/2), oy=Math.round(72+(382-rows*ts)/2);
+  G={ lvl:i, rows, cols, ts, ox, oy, walls, goals, boxes, px, py, moves:0, pushes:0, undo:[], allClear:false };
+  state='play';
+}
+function startGame(){ loadLevel(0); SFX.startBGM(); }
+const bestKey=i=>'sokoban_m_best_'+i;
+function cellC(x,y){ return [G.ox+x*G.ts+G.ts/2, G.oy+y*G.ts+G.ts/2]; }
+function snapshot(){ G.undo.push({px:G.px,py:G.py,boxes:[...G.boxes],moves:G.moves,pushes:G.pushes});
+  if(G.undo.length>500) G.undo.shift(); }
+function undo(){ if(!G.undo.length) return; const s=G.undo.pop();
+  G.px=s.px; G.py=s.py; G.boxes=new Set(s.boxes); G.moves=s.moves; G.pushes=s.pushes; SFX.undo(); }
+function move(dx,dy){
+  const nx=G.px+dx, ny=G.py+dy, nk=nx+','+ny;
+  if(G.walls.has(nk)){ SFX.blocked(); return; }
+  if(G.boxes.has(nk)){
+    const bx=nx+dx, by=ny+dy, bk=bx+','+by;
+    if(G.walls.has(bk)||G.boxes.has(bk)){ SFX.blocked(); return; }
+    snapshot();
+    G.boxes.delete(nk); G.boxes.add(bk); G.px=nx; G.py=ny; G.moves++; G.pushes++;
+    if(G.goals.has(bk)){ const [cx,cy]=cellC(bx,by); FX.burst(cx,cy,'#7CFC00',10); SFX.place(); } else SFX.move();
+    checkWin();
+  } else { snapshot(); G.px=nx; G.py=ny; G.moves++; SFX.move(); }
+}
+function checkWin(){
+  for(const g of G.goals){ if(!G.boxes.has(g)) return; }
+  G.allClear = (G.lvl>=LEVELS.length-1);
+  state='over'; SFX.win(); FX.shake(8);
+  const prev=+(localStorage.getItem(bestKey(G.lvl))||0);
+  if(prev===0 || G.moves<prev) localStorage.setItem(bestKey(G.lvl), G.moves);
+}
+function update(dt){ /* ターン制：移動は即時処理 */ }
+
+// ---- 描画 ----
+function drawFloor(px,py,ts){ ctx.fillStyle='#1b2340'; ctx.fillRect(px,py,ts,ts);
+  ctx.strokeStyle='rgba(255,255,255,0.03)'; ctx.strokeRect(px+0.5,py+0.5,ts-1,ts-1); }
+function drawWall(px,py,ts){ ctx.fillStyle='#5a6072'; ctx.fillRect(px,py,ts,ts);
+  ctx.fillStyle='rgba(255,255,255,0.12)'; ctx.fillRect(px+2,py+2,ts-4,3);
+  ctx.fillStyle='rgba(0,0,0,0.3)'; ctx.fillRect(px+2,py+ts-5,ts-4,3);
+  ctx.strokeStyle='rgba(0,0,0,0.35)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(px,py+ts/2); ctx.lineTo(px+ts,py+ts/2); ctx.moveTo(px+ts/2,py); ctx.lineTo(px+ts/2,py+ts/2); ctx.stroke();
+  ctx.strokeRect(px+0.5,py+0.5,ts-1,ts-1); }
+function drawGoal(px,py,ts){ const cx=px+ts/2,cy=py+ts/2;
+  ctx.strokeStyle='#ffd24d'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(cx,cy,ts*0.2,0,6.2832); ctx.stroke();
+  ctx.fillStyle='rgba(255,210,77,0.28)'; ctx.beginPath(); ctx.arc(cx,cy,ts*0.1,0,6.2832); ctx.fill(); ctx.lineWidth=1; }
+function drawBox(px,py,ts,onGoal){ const m=ts*0.13;
+  const col=onGoal?'#7bd06a':'#c8884a', dk=onGoal?'#3e8b3d':'#8a5a2b', lt=onGoal?'#cdeec0':'#e6bb88';
+  rrect(px+m,py+m,ts-2*m,ts-2*m,4); ctx.fillStyle=col; ctx.fill(); ctx.strokeStyle=dk; ctx.lineWidth=2; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px+m,py+m); ctx.lineTo(px+ts-m,py+ts-m); ctx.moveTo(px+ts-m,py+m); ctx.lineTo(px+m,py+ts-m); ctx.stroke();
+  ctx.fillStyle=lt; ctx.fillRect(px+m+3,py+m+3,ts-2*m-6,3); ctx.lineWidth=1;
+  if(onGoal){ ctx.fillStyle='#fff'; ctx.font='bold '+(ts*0.34|0)+'px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('✓',px+ts/2,py+ts/2+1); ctx.textBaseline='alphabetic'; } }
+function drawPlayer(px,py,ts){ const cx=px+ts/2,cy=py+ts/2,r=ts*0.32;
+  ctx.fillStyle='rgba(0,0,0,0.25)'; ctx.beginPath(); ctx.ellipse(cx,py+ts-4,r*0.85,r*0.3,0,0,6.2832); ctx.fill();
+  const g=ctx.createRadialGradient(cx-r*0.3,cy-r*0.35,r*0.2,cx,cy,r);
+  g.addColorStop(0,'#ffe0b0'); g.addColorStop(0.6,'#ff9f45'); g.addColorStop(1,'#d97a1e');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,r,0,6.2832); ctx.fill();
+  ctx.strokeStyle='rgba(0,0,0,0.3)'; ctx.lineWidth=1.5; ctx.stroke(); ctx.lineWidth=1;
+  ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(cx-r*0.3,cy-r*0.1,r*0.2,0,6.2832); ctx.arc(cx+r*0.3,cy-r*0.1,r*0.2,0,6.2832); ctx.fill();
+  ctx.fillStyle='#222'; ctx.beginPath(); ctx.arc(cx-r*0.26,cy-r*0.06,r*0.09,0,6.2832); ctx.arc(cx+r*0.34,cy-r*0.06,r*0.09,0,6.2832); ctx.fill();
+  ctx.strokeStyle='#a8550f'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(cx,cy+r*0.32,r*0.28,0.15,Math.PI-0.15); ctx.stroke(); ctx.lineWidth=1; }
+
+function render(){
+  clearBG();
+  ctx.textAlign='left'; ctx.fillStyle='#ffe27a'; ctx.font='bold 26px "Segoe UI"'; ctx.fillText('倉庫番', 24, 44);
+  ctx.fillStyle='#7e8bbf'; ctx.font='12px "Segoe UI"'; ctx.fillText('箱を◎の上に全部のせよう', 120, 42);
+  if(state==='title'){ renderTitle(); return; }
+  // 盤面
+  FX.preDraw();
+  for(let y=0;y<G.rows;y++) for(let x=0;x<G.cols;x++){ const k=x+','+y, px=G.ox+x*G.ts, py=G.oy+y*G.ts;
+    if(G.walls.has(k)) drawWall(px,py,G.ts); else { drawFloor(px,py,G.ts); if(G.goals.has(k)) drawGoal(px,py,G.ts); } }
+  for(const b of G.boxes){ const p=b.split(',').map(Number); drawBox(G.ox+p[0]*G.ts, G.oy+p[1]*G.ts, G.ts, G.goals.has(b)); }
+  drawPlayer(G.ox+G.px*G.ts, G.oy+G.py*G.ts, G.ts);
+  FX.postDraw();
+  // 難易度バッジ（右上）
+  ctx.textAlign='right'; ctx.fillStyle='#ffd24d'; ctx.font='bold 14px "Segoe UI"';
+  ctx.fillText(starStr(STARS[G.lvl]), W-16, 44);
+  ctx.fillStyle='#9fb0e8'; ctx.font='11px "Segoe UI"'; ctx.fillText(DNAME[G.lvl], W-16, 60);
+  // HUD
+  const remaining=[...G.goals].filter(g=>!G.boxes.has(g)).length;
+  const best=+(localStorage.getItem(bestKey(G.lvl))||0);
+  ctx.textAlign='left'; ctx.fillStyle='#9fb0e8'; ctx.font='14px "Segoe UI"';
+  ctx.fillText('面 '+(G.lvl+1)+'/'+LEVELS.length+'   手数 '+G.moves+'   押 '+G.pushes+'   残り '+remaining+(best?'   最少 '+best:''), 24, 500);
+  ctx.fillStyle=SFX.on?'#7CFC00':'#888'; ctx.textAlign='right'; ctx.font='12px "Segoe UI"'; ctx.fillText((SFX.on?'♪ON':'♪OFF'), W-16, 500);
+  if(state==='pause') overlay('PAUSE','#7ec8ff','「スタート/次へ」で再開');
+  if(state==='over'){
+    overlay(G.allClear?'ALL CLEAR! 🎉':'クリア！', G.allClear?'#ffd24d':'#7CFC00', G.allClear?'「スタート/次へ」で最初から':'「スタート/次へ」で次の面へ');
+    ctx.fillStyle='#fff'; ctx.font='16px "Segoe UI"'; ctx.textAlign='center'; ctx.fillText('手数 '+G.moves+'   押し '+G.pushes, W/2, H/2+10);
+  }
+}
+function renderTitle(){
+  ctx.textAlign='center';
+  ctx.fillStyle='#fff'; ctx.font='bold 40px "Segoe UI"'; ctx.fillText('倉庫番', W/2, 140);
+  drawGoal(W/2-90,170,40); drawBox(W/2-20,170,40,false); drawPlayer(W/2+50,170,40);
+  const info=['箱をすべて目標（◎）の上に乗せればクリア','盤面をスワイプ、または下の十字ボタンで押す','箱は「引けない」ので注意。もどすでやり直せる',
+    '全'+LEVELS.length+'面。やさしい → むずかしい の昇順','★最難関★の10面までたどり着けるか！'];
+  ctx.font='14px "Segoe UI"'; ctx.fillStyle='#bcd'; info.forEach((t,i)=>ctx.fillText(t,W/2,250+i*26));
+  const blink=(clock()/500|0)%2===0; ctx.fillStyle=blink?'#ffe27a':'#667'; ctx.font='bold 22px "Segoe UI"';
+  ctx.fillText('タップ／「スタート」で開始', W/2, 430);
+}
+
+// ---- 入力 ----
+function onKey(code){
+  if(code==='KeyM'){ SFX.toggle(); return; }
+  if(code==='KeyR'){ loadLevel(G?G.lvl:0); return; }
+  if(state==='title'){ if(code==='Space'||code==='Enter') startGame(); return; }
+  if(state==='over'){ if(code==='Space'||code==='Enter'){ if(G.lvl<LEVELS.length-1) loadLevel(G.lvl+1); else startGame(); } return; }
+  if(code==='KeyP'){ state = state==='play'?'pause':'play'; return; }
+  if(state!=='play') return;
+  if(code==='KeyZ'||code==='KeyU'||code==='Backspace'){ undo(); return; }
+  if(code==='ArrowLeft')  move(-1,0);
+  else if(code==='ArrowRight') move(1,0);
+  else if(code==='ArrowUp')    move(0,-1);
+  else if(code==='ArrowDown')  move(0,1);
+}
+
+// ---- スマホ操作：スワイプ＋画面ボタン ----
+function doMove(dx,dy){ if(state!=='play') return; SFX.ensure();
+  if(dx<0) move(-1,0); else if(dx>0) move(1,0); else if(dy<0) move(0,-1); else if(dy>0) move(0,1); }
+let sw=null;
+C.addEventListener('pointerdown', e=>{ SFX.ensure(); sw={x:e.clientX,y:e.clientY}; e.preventDefault(); }, {passive:false});
+C.addEventListener('pointerup', e=>{ if(!sw) return; const dx=e.clientX-sw.x, dy=e.clientY-sw.y; sw=null;
+  if(Math.abs(dx)<22 && Math.abs(dy)<22) return;          // タップはclickハンドラ（開始/次へ）に任せる
+  if(Math.abs(dx)>Math.abs(dy)) doMove(dx>0?1:-1, 0); else doMove(0, dy>0?1:-1); });
+C.addEventListener('pointercancel', ()=>{ sw=null; });
+
+document.getElementById('bUp').addEventListener('click', ()=>doMove(0,-1));
+document.getElementById('bDown').addEventListener('click', ()=>doMove(0,1));
+document.getElementById('bLeft').addEventListener('click', ()=>doMove(-1,0));
+document.getElementById('bRight').addEventListener('click', ()=>doMove(1,0));
+document.getElementById('bUndo').addEventListener('click', ()=>{ SFX.ensure(); if(state==='play') undo(); });
+document.getElementById('bRestart').addEventListener('click', ()=>{ SFX.ensure(); loadLevel(G?G.lvl:0); });
+document.getElementById('bNext').addEventListener('click', ()=>{ SFX.ensure(); onKey('Space'); });
+document.getElementById('bSound').addEventListener('click', ()=> SFX.toggle());
+
+state='title';
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
